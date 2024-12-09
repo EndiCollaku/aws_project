@@ -1,0 +1,174 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+
+    outputs:
+      DATABASE_HOST: ${{ steps.capture_outputs.outputs.DATABASE_HOST }}
+      DATABASE_USER: ${{ steps.capture_outputs.outputs.DATABASE_USER }}
+      DATABASE_PASSWORD: ${{ steps.capture_outputs.outputs.DATABASE_PASSWORD }}
+      DATABASE_NAME: ${{ steps.capture_outputs.outputs.DATABASE_NAME }}
+      ECR_REPO_NAME: ${{ steps.capture_outputs.outputs.ECR_REPO_NAME }}
+      ECR_URL: ${{ steps.capture_outputs.outputs.ECR_URL }}
+      FULL_ECR: ${{ steps.capture_outputs.outputs.FULL_ECR }}
+      EKS_CLUSTER_NAME: ${{ steps.capture_outputs.outputs.EKS_CLUSTER_NAME }}
+      S3_BUCKET_NAME: ${{ steps.capture_outputs.outputs.S3_BUCKET_NAME }}
+
+    steps:
+      - id: checkout_code
+        name: Checkout Code
+        uses: actions/checkout@v3
+
+      - id: configure_aws_credentials
+        name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-west-1
+
+      - id: setup_terraform
+        name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.3.5
+          terraform_wrapper: false
+
+      - id: terraform_init
+        name: Terraform Init
+        run: terraform init
+        working-directory: ./terraform  
+
+      - id: terraform_fmt
+        name: Terraform Fmt
+        run: terraform fmt -recursive
+        working-directory: ./terraform  
+
+      - id: terraform_apply
+        name: Terraform Apply (with auto-approve)
+        run: terraform apply -auto-approve 
+
+        working-directory: ./terraform 
+        
+      - id: capture_outputs
+        name: Capture Terraform Outputs
+        run: |
+          echo "DATABASE_HOST=$(terraform output -raw DATABASE_HOST)" >> $GITHUB_OUTPUT
+          echo "DATABASE_USER=$(terraform output -raw DATABASE_USER)" >> $GITHUB_OUTPUT
+          echo "DATABASE_PASSWORD=$(terraform output -raw DATABASE_PASSWORD)" >> $GITHUB_OUTPUT
+          echo "DATABASE_NAME=$(terraform output -raw DATABASE_NAME)" >> $GITHUB_OUTPUT
+          echo "ECR_REPO_NAME=$(terraform output -raw ECR_REPO_NAME)" >> $GITHUB_OUTPUT
+          ECR_URL=$(terraform output -raw ECR_URL)
+          echo "ECR_URL=${ECR_URL}" >> $GITHUB_OUTPUT
+          echo "FULL_ECR=$(terraform output -raw FULL_ECR)" >> $GITHUB_OUTPUT
+          echo "EKS_CLUSTER_NAME=$(terraform output -raw EKS_CLUSTER_NAME )" >> $GITHUB_OUTPUT
+          S3_BUCKET_NAME=$(terraform output -raw  S3_BUCKET_NAME)
+          echo "S3_BUCKET_NAME=${S3_BUCKET_NAME}" >> $GITHUB_OUTPUT
+        working-directory: ./terraform  
+
+  api:
+    runs-on: ubuntu-latest
+    needs: setup  
+
+    outputs:
+      EXTERNAL_IP: ${{ steps.get_external_ip.outputs.external_ip }}  
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - id: configure_aws_credentials
+        name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-west-1
+
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+        
+          
+
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: ${{ needs.setup.outputs.ECR_REPO_NAME }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          echo ${{ secrets.AWS_ACCESS_KEY_ID }} 
+          echo ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          docker build -t "${{ env.REGISTRY }}/${{ env.REPOSITORY }}:${{ env.IMAGE_TAG }}" ./api
+          docker push "${{ env.REGISTRY }}/${{ env.REPOSITORY }}:${{ env.IMAGE_TAG }}"
+          echo "IMAGE_URL=${{ env.REGISTRY }}/${{ env.REPOSITORY }}:${{ env.IMAGE_TAG }}" >> $GITHUB_OUTPUT
+          
+      - uses: tale/kubectl-action@v1
+        with:
+          base64-kube-config: ${{ secrets.KUBE_CONFIG }}
+
+   
+      - name: Apply api-deployment yaml file
+        run: |
+          export DATABASE_HOST="${{ needs.setup.outputs.DATABASE_HOST }}"
+          export DATABASE_USER="${{ needs.setup.outputs.DATABASE_USER }}"
+          export DATABASE_PASSWORD="${{ needs.setup.outputs.DATABASE_PASSWORD }}"
+          export DATABASE_NAME="${{ needs.setup.outputs.DATABASE_NAME }}"
+          export IMAGE_URL="${{ steps.build-image.outputs.IMAGE_URL }}"
+          envsubst < ./api/api-deployment.yaml | kubectl apply -f -
+
+      - name: Get External IP of API Service
+        id: get_external_ip
+        run: |
+          EXTERNAL_IP=$(kubectl get svc api-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          echo "external_ip=$EXTERNAL_IP" >> $GITHUB_OUTPUT
+
+  frontend:
+    runs-on: ubuntu-latest
+    needs: 
+      - api
+      - setup
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: web_client
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - id: configure_aws_credentials
+        name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-west-1  
+
+      - name: Build React App
+        run: |
+          export REACT_APP_SERVER_URL="http://${{ needs.api.outputs.EXTERNAL_IP }}"  # Use the external IP from the api job
+          npm install
+          npm run build
+
+      - name: Debug output
+        run: echo '${{ toJSON(needs.setup.outputs) }}'    
+
+      - name: Sync to S3
+        run: |
+          echo ${{ needs.setup.outputs.S3_BUCKET_NAME }}
+          aws s3 sync ./build s3://${{ needs.setup.outputs.S3_BUCKET_NAME }} --delete  # Use the S3 bucket name from setup job
+      

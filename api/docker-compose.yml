@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  api:
+    build: ./
+    container_name: api-container
+    ports:
+      - "5000:5000"
+    depends_on:
+      - db
+    networks:
+      - app-network
+    command: ["sh", "-c", "sleep 10 && npm start"]  # Delay the start to wait for db
+
+  db:
+    image: postgres:13
+    container_name: db-container
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: mydatabase
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  db-data:
+    driver: local
